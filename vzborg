@@ -1,0 +1,1220 @@
+#!/usr/bin/env bash
+# vim: set filetype=sh :
+
+# BASH SETTINGS
+
+# Make the script exit when a command fails (set -e).
+set -o errexit
+# Make the script exit when tries to use undeclared variables (set -u)
+set -o nounset
+# Exit on pipe fail
+set -o pipefail
+# set -o xtrace
+
+# USEFUL FUNCTIONS
+
+# trap ctrl-c and call ctrl_c()
+trap ctrl_c INT
+ctrl_c() {
+    echo "** Trapped CTRL-C"
+}
+say() {
+    echo -e vzborg: ${1}
+}
+die() {
+    say "Error, ${1}" >&2
+    exit 1
+}
+sorry() {
+    say "Sorry, ${1}" >&2
+}
+divider() {
+    echo '------------------------------------------------------------------------------'
+}
+debug() {
+    echo -e "#[DEBUG] $(date "+%F %T") ${1}" >&1
+}
+version_greater_equal() {
+    printf '%s\n%s\n' "$2" "$1" | sort -V -C
+}
+is_valid_guest_id() {
+	if [[ -z ${1:-''} ]]; then
+        # empty value
+        exit 1
+	fi
+    local re='^[1-9]([0-9]+)?$'
+    if ! [[ $1 =~ $re ]] ; then
+        # not an integer that does not begin with 0
+        exit 1
+    fi
+    if [ "$1" -lt 100 ] || [ "$1" -gt 999999999 ]; then
+       # invalid range
+        exit 1
+    fi
+    exit 0
+}
+# VZBORG FUNCTIONS
+vzborg_backup() {
+    if [[ ${show_command_help} = true ]]; then
+        echo
+        echo "NAME"
+        echo "  vzborg backup"
+        echo
+        echo "USAGE"
+        echo "  vzborg backup (-i|--id) (<vmid>|<vmid_list>|all) \\"
+        echo "                   [ (-m|--mode) (snapshot|stop|suspend)] \\"
+        echo "                   [ (-p|--purge)  \\"
+        echo "                     [ ( -k|--keep) <n>] \\"
+        echo "                     [ --keep-last=<n> ] \\"
+        echo "                     [ --keep-hourly=<n>] \\"
+        echo "                     [ --keep-daily=<n>] \\"
+        echo "                     [ --keep-weekly=<n>] \\"
+        echo "                     [ --keep-monthly=<n>] \\"
+        echo "                     [ --keep-yearly=<n>] \\"
+        echo "                   ] \\"
+        echo "                   [ (-r|--repository) <repository>]"
+        echo
+        echo "  <vmid>: <integer> (100 - N) The (unique) ID of a PVE guest"
+        echo "  <vmid_list>: <string> (space separated list of <vmid>s"
+        echo "  Retention options:"
+        echo "    The following are the valid retention options, where <n> is the number of backups"
+        echo "    of that type to keep, or a negative number to keep them all:"
+        echo "      ( -k|--keep) <n>   Keep last <n> backups"
+        echo "      --keep-last=<n>"
+        echo "      --keep-hourly=<n>"
+        echo "      --keep-daily=<n>"
+        echo "      --keep-weekly=<n>"
+        echo "      --keep-monthly=<n>"
+        echo "      --keep-yearly=<n>"
+        echo "  <repository>: <path> (full repository path)"
+        echo
+        echo "DESCRIPTION"
+        echo "  vzborg backup command lets you perform a backup job of one, several, or all"
+        echo "  the guests on a Proxmox node, optionally purging the repository."
+        echo
+        echo "  When executed, the vzborg backup command will create the related repository"
+        echo "   if it does not exist, using the default values."
+        echo
+        echo "  Dump mode:"
+        echo "    By default, vzborg backup will use vzdump snapshot mode, which keeps the guest running"
+        echo "    during the backup operation."
+        echo "    If you need to stop or suspend the guest during the backup, for consistence or other reasons, "
+        echo "    you can do it with the -m or --mode option in the command line."
+        echo
+        echo "  Purging:"
+        echo "    When using the -p or --purge option, a purge operation for each successfully backed up "
+        echo "    guest will be performed on the repository."
+        echo "    If no retention settings are informed in the command line with the -k or --keep option,"
+        echo "    the default retention options or keep settings, will be used."
+        echo
+        echo "    Purging while performing the backup, may be desirable when there are space restrictions."
+        echo "    Be aware that purging will add some time to the total backup operation."
+        echo
+        echo "    If you do not purge your repository during backups, you can do it manually or with "
+        echo "    a cron job, using the \"vzborg purge\" command."
+        echo
+        echo "    Be careful when purging. If for example you run the backup with just "
+        echo "    a \"--keep-daily=2\" option, you will end up with only the last 2 daily "
+        echo "    backups of the guests involved, and that may be not what you want."
+        echo
+        echo "EXAMPLES"
+        echo
+        echo "  Backup guest 1301 to default repository with default mode snapshot"
+        echo "  options."
+        echo "    vzborg backup -i 1301"
+        echo
+        echo "  Backup guest 1301, 204 and 301 to repository /var/lib/vzborgrepo with mode stop"
+        echo "    vzborg backup -i '1301 204 301' -r /var/lib/vzborgrepo -m stop"
+        echo
+        echo "  Backup all guests on the proxmox node, purging the repository with the default retention setting"
+        echo "    vzborg backup --id all --purge"
+        echo
+        echo "  Backup all guests on the proxmox node, purging the repository with a specific retention setting"
+        echo "    vzborg backup --id all --purge --keep-daily=2 --keep-weekly=4 --keep-monthly=3 --keep-yearly=1"
+        echo
+        exit
+    fi
+
+    if [ -z "${vm_ids:-}" ]; then
+        die 'No guests to backup. Check your -i o --id option.'
+    fi
+
+    local backup_comment=''
+    local backup_compression="--compression=${default_compression}"
+    local backup_name=''
+    local retention=${keep_setting:-$DEFAULT_KEEP}
+    # status
+    local backup_status=''
+    local purge_status=''
+    # elapsed seconds
+    local backup_es=0
+    local purge_es=0
+    # guest vm data
+    local vm_config=''
+    local vm_ext=''
+    local vm_hostname=''
+    local vm_type=''
+
+    # Virtual machines IDs
+    if [[ $vm_ids = "all" ]]; then
+        # containers ids
+        local ctids="$(pct list | awk '{print $1}' | grep -v ID)"
+        # quemu vm ids
+        local vmids="$(qm list | awk '{print $1}' | grep -v ID)"
+        # All ids sorted and cleaned in a string
+        vm_ids=$(echo -e "${vmids}\n${ctids}" | sort -n | tr '\n' ' ' | xargs)
+
+    fi
+
+    #say "Checking repository" |& tee -a ${detail_file}
+    #borg info ${borg_extra} ${vzborg_repo} || borg init ${borg_extra}  	--make-parent-dirs --encryption=${encryption_mode} ${vzborg_repo}
+    say "Retrieving ${vzborg_repo} repository info" |& tee -a ${detail_file}
+    divider |& tee -a ${detail_file}
+    # Try to get repository info. On fail init repository.
+    if ! borg info ${borg_extra} ${vzborg_repo}; then
+        say "Creating ${vzborg_repo} repository" |& tee -a ${detail_file}
+        if ! borg init ${borg_extra}  	--make-parent-dirs --encryption=${encryption_mode} ${vzborg_repo}; then
+            die "Failed creating ${vzborg_repo} repository. Check your repository definition." |& tee -a ${detail_file}
+        fi
+    fi
+    divider |& tee -a ${detail_file}
+    say "> Host $(hostname) - Backup job started for guests $vm_ids." |& tee -a ${detail_file}
+    say "> Repository ${vzborg_repo}." |& tee -a ${detail_file}
+    if [[ ${purge_on_backup} = true ]]; then
+        say "> with purge option and retention \"${retention}\"." |& tee -a ${detail_file}
+    fi
+
+    # Loop through each VM ID
+    for VM_ID in $vm_ids; do
+        # Get info about guest VM
+        if [ -e "${ct_conf_dir}${VM_ID}.conf" ]; then
+            #   Is a container
+            vm_type='CT'
+            vm_ext='tar'
+            vm_hostname="$(grep -m 1 ^hostname ${ct_conf_dir}${VM_ID}.conf | awk '{print $2}')"
+            vm_config="$(cat ${ct_conf_dir}${VM_ID}.conf)"
+        else
+            if [ -e "${vm_conf_dir}${VM_ID}.conf" ]; then
+                # is a virtual machine
+                vm_type='VM'
+                vm_ext='vma'
+                vm_hostname="$(grep -m 1 ^name ${vm_conf_dir}${VM_ID}.conf | awk '{print $2}')"
+                vm_config="$(cat ${vm_conf_dir}${VM_ID}.conf)"
+            else
+                # unknown vm
+                vm_type='--'
+                vm_hostname='No_Virtual_Machine_with_this_ID'
+                backup_status='failed'
+                printf "$line_format" $vm_type $VM_ID 0 0 0 $backup_status 0 0 0 'no' $vm_hostname >>${summary_file}
+                continue
+            fi
+        fi
+
+        # Include vm type, id, hostname and configuration info as comment in backup
+        backup_comment=$(echo -e "--comment=([vm_type]=${vm_type} [vm_id]=${VM_ID} [vm_hostname]=${vm_hostname})\nBEGIN_CONFIG>\n${vm_config}\n<END_CONFIG")
+        backup_name="${archs_prefix}-${VM_ID}-$(date '+%Y_%m_%d-%H_%M_%S').${vm_ext}"
+
+        say "-> Beginning backup of ${vm_type} ${VM_ID} (${vm_hostname})" |& tee -a ${detail_file}
+        SECONDS=0
+        if vzdump ${VM_ID} --dumpdir ${temp_dir} --quiet ${vzdump_quiet} --compress 0 --mode ${vzdump_mode} --stdout | borg create ${borg_extra} --files-cache=disabled --stdin-name=vzborgdump --chunker-params ${default_chunker} -s "${backup_compression}" "${backup_comment}" \
+            ${vzborg_repo}::${backup_name} - |& tee -a ${detail_file}; then
+            # rename temporary archive
+            # this adds 10 minutes to each backup
+            #borg rename ${borg_extra} ${vzborg_repo}::${backup_name}.tmp ${backup_name}
+            backup_status='ok'
+        else
+            backup_status='failed'
+        fi
+        backup_es=$SECONDS
+        if [[ ${purge_on_backup} = true ]]; then
+            SECONDS=0
+            say "--> Purging" |& tee -a ${detail_file}
+            if borg prune ${borg_extra} -v -s --list ${dry_run} ${retention} --prefix ${archs_prefix}-${VM_ID} ${vzborg_repo} |& tee -a ${detail_file}; then
+                purge_status='done'
+            else
+                purge_status='failed'
+            fi
+            purge_es=$SECONDS
+            say "<-- Done Purging" |& tee -a ${detail_file}
+        else
+            purge_status='no'
+        fi
+
+        say "<- Finished backup of ${vm_type} ${VM_ID} (${vm_hostname})." |& tee -a ${detail_file}
+
+        printf "$line_format" $vm_type $VM_ID $(($backup_es / 3600)) $(($backup_es % 3600 / 60)) $(($backup_es % 60)) $backup_status $(($purge_es / 3600)) $(($purge_es % 3600 / 60)) $(($purge_es % 60)) $purge_status $vm_hostname >>${summary_file}
+    done
+}
+vzborg_delete() {
+    if [[ ${show_command_help} = true ]]; then
+        echo
+        echo "NAME"
+        echo "  vzborg delete"
+        echo
+        echo "USAGE"
+        echo "   vzborg delete ((-b|--backup) <backup_name>) | ((-i|--id) (<vmid>|<vmid_list>|all)) \\"
+        echo "                   [ (-r|--repository) <repository>]"
+        echo
+        echo "  <backup_name> <string> (name of a backup of a guest)"
+        echo "  <vmid>: <integer> (100 - N) The (unique) ID of a PVE guest"
+        echo "  <vmid_list>: <string> (space separated list of <vmid>s"
+        echo "  <repository>: <path> (full repository path)"
+        echo
+        echo "DESCRIPTION"
+        echo "  The vzborg delete command removes backups from the default repository,"
+        echo "  or from the one indicated with the (-r|--repository) option."
+        echo "  When used with the (-b|--backup) option, only the specified backup is removed."
+        echo "  With the (-i|--id) option you can remove all existing backups of a guest, all the"
+        echo "  backups of a list of guests, or all the backups in the repository."
+        echo
+        echo "EXAMPLES"
+        echo
+        echo "  delete all backups of VM/CT with Ids 123, 124 and 201 in default repository:"
+        echo "    vzborg delete --id '123 124 201'"
+        echo
+        echo "  delete all backups of VM/CT with ID 303 in borg repository /var/lib/vz/borg:"
+        echo "    vzborg delete --id 303 --repository /var/lib/vz/borg"
+        echo
+        echo "  Delete backup vzborg-1301-2020_03_20-13_18_45.vma"
+        echo "  from default repository"
+        echo "    vzborg delete -b vzborg-1301-2020_03_20-13_18_45.vma"
+        echo
+        echo "  Delete backup vzborg-141-2020_03_20-13_18_45.tar in repository /mnt/vzborgrepo"
+        echo "    vzborg delete -b vzborg-141-2020_03_20-13_18_45.tar -r /mnt/vzborgrepo"
+        echo
+        echo "  Delete all backups in repository /mnt/vzborgrepo"
+        echo "    vzborg delete --id all --repository /mnt/vzborgrepo"
+        echo
+        exit
+    fi
+
+    local archives=''
+    local borg_format='--format={archive}{SPACE}'
+    local borg_archive=${backup_name}
+    local dump_type=''
+
+    if ! [ -z "${borg_archive}" ]; then
+        # delete specific backup
+        case ${borg_archive} in
+        *.tar) dump_type='lxc' ;;
+        *.vma) dump_type='qemu' ;;
+        *.tmp) dump_type='tmp' ;;
+        *) die "Option -b \"${borg_archive}\" is not a valid backup name" ;;
+        esac
+        # TODO Check if archive borg_archive exist in borg repo.
+        say "Deleting backup ${borg_archive}"
+        borg delete ${borg_extra} -s ${vzborg_repo}::${borg_archive}
+    fi
+    # Virtual machines IDs
+    if ! [ -z "${vm_ids}" ]; then
+        # delete by guest id
+        if [[ $vm_ids = "all" ]]; then
+            # delete all backups
+            archives=$(borg list ${borg_extra} ${borg_format} "${vzborg_repo}" -P ${archs_prefix}- | sort )
+            say "> Deleting all backups from repository ${vzborg_repo}"
+            for archive in $archives; do
+                say "-> Deleting ${archive}"
+                borg delete ${borg_extra} -s "${vzborg_repo}::${archive}"
+            done
+        else
+            # delete all backups of given guests
+            for VM_ID in $vm_ids; do
+                archives=$(borg list ${borg_extra} ${borg_format} "${vzborg_repo}" -P ${archs_prefix}-${VM_ID})
+                say "Deleting all backups of guest ${VM_ID}"
+                for archive in $archives; do
+                    say "-> Deleting ${archive}"
+                    borg delete ${borg_extra} -s "${vzborg_repo}::${archive}"
+                done
+            done
+        fi
+    fi
+
+}
+vzborg_getdump() {
+    if [[ ${show_command_help} = true ]]; then
+        echo
+        echo "NAME"
+        echo "  vzborg getdump"
+        echo
+        echo "USAGE"
+        echo "  vzborg getdump (-b|--backup) <backup_name> | (-i|--id) <vmid> \\"
+        echo "                   [ (-r|--repository) <repository>] \\"
+        echo "                   [ (-s|--storage) <storage>]"
+        echo
+        echo "  <backup_name>: <string> (name of a vzborg backup of a guest)"
+        echo "  <vmid>: <integer> (100 - N) The (unique) ID of a backed up PVE guest."
+        echo "  <repository>: <path> (full repository path)"
+        echo "  <storage>: <string> (Proxmox storage where the dump file must be recreated"
+        echo
+        echo "DESCRIPTION"
+        echo "  The vzborg getdump command recreates a dump file into a suitable proxmox storage, from a backup in a "
+        echo "  repository. If an ID is provided instead of a backup name, vzborg gets the last dump of that guest."
+        echo "  The recreated file, will follow the proxmox dump naming convention."
+        echo
+        echo "EXAMPLES"
+        echo
+        echo "  Recreate dump file vzdump-qemu-1301-2020_03_20-13_18_45.vma.lzo"
+        echo "  from backup vzborg-1301-2020_03_20-13_18_45.vma in default repository "
+        echo "  to proxmox storage backup"
+        echo "    vzborg getdump -b vzborg-1301-2020_03_20-13_18_45.vma -s backup"
+        echo
+        echo "  Recreate the dump file of the last backup of guest 144"
+        echo "  in default repository to storage weekly"
+        echo "    vzborg getdump -i 144 -s weekly"
+        echo
+        echo "  Recreate dump file vzdump-lxc-141-2020_03_20-13_18_45.tar.lzo"
+        echo "  from backup vzborg-141-2020_03_20-13_18_45.tar in repository /mnt/vzborgrepo"
+        echo "  to default proxmox storage"
+        echo "    vzborg getdump -b vzborg-141-2020_03_20-13_18_45.tar -r /mnt/vzborgrepo"
+        echo
+        exit
+    fi
+
+    local backup_id=${vm_ids:-''}
+    local borg_archive=${backup_name}
+    local compression_level=''
+    local dump_dir=''
+    local dump_file=''
+    local dump_storage=${pve_storage:-local}
+    local dump_type=''
+    local find_archive=''
+    local storage_content=''
+
+    # check if required options where informed and are valid
+    if [ -z "${borg_archive}" ]; then
+        # no backup name to restore
+        if [[ -z ${backup_id} ]]; then
+            # no backup id
+            die "vzborg getdump requires a (-b|--backup) or a (-i|--id) option."
+        else
+            # getdump by id.
+            if ! (is_valid_guest_id "${backup_id}") ; then
+            die "\"${backup_id}\" is not a valid guest ID number."
+        fi
+            #Get the backup name of the last backup for the guest
+            borg_archive=$(borg list ${borg_extra} --format={archive}{NL} ${vzborg_repo} -P ${archs_prefix}-${backup_id}- | sort -r | head -1)
+            if [[ -z ${borg_archive} ]]; then
+                die "guest ${backup_id} has no backup in repository ${vzborg_repo}."
+            fi
+        fi 
+    else
+        if ! [[ -z ${backup_id} ]]; then
+            # backup id also informed
+            die "vzborg getdump requires a (-b|--backup) or a (-i|--id) option, but not both."
+        fi
+        # check if backup exists in repository
+        #find_archive=$(borg info ${borg_extra} ${vzborg_repo}::${borg_archive})
+        #if [[ -z $find_archive ]]; then
+        if [[ ! $(borg info ${borg_extra} ${vzborg_repo}::${borg_archive}) ]]; then
+            die "backup ${borg_archive} does not exist in repository ${vzborg_repo}."
+        fi
+    fi
+
+    case ${borg_archive} in
+    *.tar)
+        dump_type='lxc'
+        compression_level=7 ;;
+    *.vma)
+        dump_type='qemu'
+        compression_level=3 ;;
+    *) die "option -b \"${borg_archive}\" is not a valid backup name" ;;
+    esac
+
+    #  Recreate normal proxmox backup file name (add qemu/lxc type to file name)
+    dump_file=${borg_archive/${archs_prefix}/vzdump-${dump_type}}
+
+    storage_content=$(sed -n "/: ${dump_storage}/,/:/{s/^[[:space:]]*content //p }" /etc/pve/storage.cfg)
+    if [[ ! "$storage_content" == *backup* ]]; then
+        die "Storage \"${dump_storage}\" is not a backup storage"
+    fi
+
+    # Get dumps directory from storage configuration file
+    dump_dir=$(grep -A 99999 ${dump_storage} /etc/pve/storage.cfg | grep -m1 path | sed -n -e 's/^.*path //p')/dump
+ 
+    # Check if file exist
+    if [[ -f ${dump_dir}/${dump_file}.lzo ]]; then
+        die "dump file ${dump_dir}/${dump_file} already exists."
+    fi
+
+    say "Recreating dump file ${dump_file}.lzo into ${dump_storage} storage"
+    borg extract ${borg_extra} --stdout ${vzborg_repo}::${borg_archive} | lzop -${compression_level} --output=${dump_dir}/${dump_file}.lzo -
+    say "Recreation finished"
+
+}
+vzborg_help() {
+    echo "NAME"
+    echo "  vzborg"
+    echo
+    echo "USAGE"
+    echo "  vzborg <COMMAND> [OPTIONS]"
+    echo
+    echo "DESCRIPTION"
+    echo "  vzborg lets you perform and maintain deduplicated, encrypted backups of your Proxmox guests"
+    echo "  in local and/or remote repositories"
+    echo
+    echo "  VzBorg does not use any positional parameters after the <COMMAND>. It only uses options."
+    echo "  Specified, but not used options, are ignored."
+    echo "  If duplicated options are informed, only the last one is used."
+    echo
+    echo "COMMANDS"
+    echo "  VzBorg must be used with one of the following commands:"
+    echo
+    echo "     COMMAND   Description"
+    echo
+    echo "     backup    Perform a backup job."
+    echo "     delete    Delete a specific, or all backups of a guest."
+    echo "     getdump   Recreate a dump file from a backup."
+    echo "     help      Show this help."
+    echo "     info      Show info about a backup or repository"
+    echo "     list      List backups in a repository."
+    echo "     list-size List backups in a repository with their size information."
+    echo "     purge     Purge (prune) a repository."
+    echo "     restore   Restore backup from a repository."
+    echo "     version   Show VzBorg, Borg and PVE version."
+    echo
+    echo "  Hint: Use \"vzborg <COMMAND> -h\" to get specific help about a command"
+    echo
+    echo "OPTIONS"
+    echo
+    echo "  -b|--backup <backup_name>        - Name of an existing backup (archive)."
+    echo "                                     use: delete|info|restore"
+    echo "  -c|--config <config_name>        - Read configuration file with name <config_name>"
+    echo "                                     use: all except help and version"
+    echo "  -d|--dry-run                     - Dry run. Perform simulation"
+    echo "                                     use: purge"
+    echo "  -f|--force                       - Force overwrite of existing VM/CT"
+    echo "                                     use: restore"
+    echo "  -h|--help                        - Display command help."
+    echo "                                     use: all except help and version"
+    echo "  -i|--id (<vmid>|<vmid_list>|all) - PVE guest ID, list of PVE guest IDs, or \"all\""
+    echo "                                     use: backup|delete|list|restore"
+    echo "  -k|--keep <retention_options>    - List of borg keep settings (retention options)."
+    echo "                                     use: backup/purge"
+    echo "  -m|--mode <mode>                 - vzdump mode <snapshot|stop|suspend> (default=snapshot)."
+    echo "                                     use: backup"
+    echo "  -n|--new-id <vmid>               - New VM ID for a restored backup guest"
+    echo "                                     use: restore"
+    echo "  -p|--purge                       - Purge repository during backup"
+    echo "                                     use: backup"
+    echo "  -r|--repository <repository>     - VzBorg repository path."
+    echo "                                     use: all except help and version"
+    echo "  -s|--storage <storage>           - Proxmox storage (default = local)"
+    echo "                                     use: getdump|restore"
+    echo
+    echo "CONFIGURATION"
+    echo "  vzborg uses the following configuration file:"
+    echo
+    echo "  /etc/vzborg/default"
+    echo
+    echo "    Edit before using vzborg for the first time."
+    echo "    Use the comments in the file as guidance."
+    echo
+    echo "    You can set default values for:"
+    echo "      - Repository location"
+    echo "      - Encryption"
+    echo "      - Backup retention settings (keep settings)"
+    echo "      - Compression"
+    echo "      - Admin e-mail"
+    echo "      - Temporary directory"
+    echo
+    echo "    You can create and use additional configuration files in the /etc/vzborg directory,"
+    echo "    to override when you need, the values from the default config."
+    echo "    This additional configuration files can be specified with the option -c|--config"
+    echo "    and are processed in the order in which they appear in the command line."
+    echo
+    echo "VZBORG EXAMPLES"
+    echo "    vzborg restore --help"
+    echo "    vzborg backup --id '101 102 307'"
+    echo "    vzborg backup --id all"
+    echo "    vzborg restore --backup vzborg-300-2020_03_20-13_11_46.vma --id 1300 --storage local_lvm"
+    echo "    vzborg list"
+    echo "    vzborg list -i 303 --repository ssh://example.com:22/mnt/remote_borg_repo"
+    echo "    vzborg list -i '1230 1040 2077' -r /mnt/vzborg"
+    echo "    vzborg list-size"
+    echo "    vzborg list-size -i 303"
+    echo "    vzborg getdump --backup vzborg-13998-2020_03_20-13_08_35.tar --storage local_lvm"
+    echo "    vzborg purge -i '101 102 307'"
+    echo "    vzborg purge -i '101 102 307' --keep '--keep-weekly=4 --keep-monthly=6 --keep-yearly=2'"
+    echo
+    echo "NOTES"
+    echo " About VzBorg backup (archive) names:"
+    echo
+    echo "  VzBorg encodes the guest id and the backup time into the name, for example for a container guest:"
+    echo "    vzborg-105-2009_10_09-11_04_43.tar"
+    echo "  or for a qemu guest:"
+    echo "    vzborg-303-2020_03_27-14_10_12.vma"
+    echo
+}
+vzborg_info() {
+    if [[ ${show_command_help} = true ]]; then
+        echo
+        echo "NAME"
+        echo "  vzborg info"
+        echo
+        echo "USAGE"
+        echo "  vzborg info [ (-b|--backup) <backup_name>] \\"
+        echo "                   [ (-r|--repository) <repository>]"
+        echo
+        echo "  <backup_name>: <string> (name of a vzborg backup of a guest)"
+        echo "  <repository>: <path> (full repository path)"
+        echo
+        echo "DESCRIPTION"
+        echo "  The vzborg info command when used with a backup name, will give statistical information"
+        echo "  about that specific backup, including:"
+        echo "    - guest type, id and hostname."
+        echo "    - proxmox host."
+        echo "    - star, end, and backup duration time."
+        echo "    - original, compressed, and deduplicated size."
+        echo "    - complete guest configuration details."
+        echo
+        echo "  When used without a backup name, the vzborg info command will display statistical information"
+        echo "  about the default repository, or the one specified with the -r or --repository option"
+        echo
+        echo "EXAMPLES"
+        echo
+        echo "  List info about default repository:"
+        echo "    vzborg info"
+        echo
+        echo "  List info of backup vzborg-lxc-13998-2020_03_20-13_08_35.tar in borg repository /var/lib/vz/borg:"
+        echo "    vzborg info -b vzborg-lxc-13998-2020_03_20-13_08_35.tar -r /var/lib/vz/borg"
+        echo
+        exit
+    fi
+    # Set a default list format
+    local list_format='{bcomment}{NL}'
+    local list_file="$(mktemp ${temp_dir}/vzborg.XXXXXX)"
+
+    if ! [ -z "${backup_name}" ]; then
+        local borg_format="--format=${list_format}"
+        echo -e "\nBackup Information:" >${list_file}
+        echo -e "------------------" >>${list_file}
+        borg info ${borg_extra} "${vzborg_repo}::${backup_name}" | sed "/BEGIN_CONFIG>/,/<END_CONFIG/d" >>${list_file}
+        # Extract config file info from comment in archive
+        echo -e "\nGuest Configuration File:" >>${list_file}
+        echo -e "------------------------" >>${list_file}
+        borg list ${borg_extra} "${borg_format}" "${vzborg_repo}" -P "${backup_name}" | sed -n '/BEGIN_CONFIG>/,/<END_CONFIG/{ /_CONFIG/d; p }' >>${list_file}
+    else
+        echo -e "\nRepository Information:" >${list_file}
+        echo -e "----------------------" >>${list_file}
+        borg info ${borg_extra} "${vzborg_repo}" >>${list_file}
+    fi
+
+    cat ${list_file}
+    rm ${list_file}
+}
+vzborg_list() {
+    if [[ ${show_command_help} = true ]]; then
+        echo
+        echo "NAME"
+        echo "  vzborg list"
+        echo
+        echo "USAGE"
+        echo "  vzborg list [ (-i|--id) (VMID|VMIDS_LIST)] \\"
+        echo "                   [ (-r|--repository) <repository>]"
+        echo
+        echo "  <vmid>: <integer> (100 - N) The (unique) ID of a PVE guest"
+        echo "  <vmid_list>: <string> (space separated list of <vmid>s"
+        echo "  <repository>: <path> (full repository path)"
+        echo
+        echo "DESCRIPTION"
+        echo "  The vzborg list command, when used without the -i or --id option,  will display a list of "
+        echo "  all existing backups in the default repository, or in the one specified with the -r or "
+        echo "  --repository option."
+        echo "  When used with the -i or --id option, will dipslay a list of all existing backups for the"
+        echo "  specified guests."
+        echo
+        echo "  The list contains the backup name, guest type, id and hostname. If you need more info about a "
+        echo "  specific backup, use the vzborg info command."
+        echo
+        echo "EXAMPLES"
+        echo
+        echo "  List all backups in the default repository:"
+        echo "    vzborg list"
+        echo
+        echo "  List backups of guest with ID 303 in the repository /var/lib/vz/vzborg:"
+        echo "    vzborg list -i 303 -r /var/lib/vz/vzborg"
+        echo
+        exit
+    fi
+    # Set a default list format
+    local list_format='{archive} {bcomment}{NL}'
+    local borg_format="--format=${list_format}"
+
+    local list_file="$(mktemp ${temp_dir}/vzborg.XXXXXX)"
+
+    # Virtual machines IDs
+    if ! [ -z "${vm_ids}" ]; then
+        for VM_ID in $vm_ids; do
+            borg list ${borg_extra} "${borg_format}" "${vzborg_repo}" -P "${archs_prefix}-${VM_ID}-" >>${list_file}
+        done
+    else
+        borg list ${borg_extra} "${borg_format}" "${vzborg_repo}" -P ${archs_prefix}- >>${list_file}
+    fi
+    # Remove configuration file info and sort by archive name
+    cat ${list_file} | sed "/BEGIN_CONFIG>/,/<END_CONFIG/d" | sort
+    rm ${list_file}
+}
+vzborg_list_size() {  
+    if [[ ${show_command_help} = true ]]; then
+        echo
+        echo "NAME"
+        echo "  vzborg list-size"
+        echo
+        echo "USAGE"
+        echo "  vzborg list-size [ (-i|--id) (VMID|VMIDS_LIST)] \\"
+        echo "                   [ (-r|--repository) <repository>]"
+        echo
+        echo "  <vmid>: <integer> (100 - N) The (unique) ID of a PVE guest"
+        echo "  <vmid_list>: <string> (space separated list of <vmid>s"
+        echo "  <repository>: <path> (full repository path)"
+        echo
+        echo "DESCRIPTION"
+        echo "  The vzborg list-size command, when used without the -i or --id option,  will display a list of "
+        echo "  all existing backups in the default repository, or in the one specified with the -r or "
+        echo "  --repository option."
+        echo "  When used with the -i or --id option, will dipslay a list of all existing backups for the"
+        echo "  specified guests."
+        echo
+        echo "  The list contains the original size, compressed size and duplicated size of a backup. If you need more info about a "
+        echo "  specific backup, use the vzborg info command."
+        echo
+        echo "EXAMPLES"
+        echo
+        echo "  List all backups in the default repository:"
+        echo "    vzborg list-size"
+        echo
+        echo "  List backups of guest with ID 303 in the repository /var/lib/vz/vzborg:"
+        echo "    vzborg list-size -i 303 -r /var/lib/vz/vzborg"
+        echo
+        exit
+    fi
+    local backups_list=''
+
+    # Virtual machines IDs
+    if ! [ -z "${vm_ids}" ]; then
+        for VM_ID in $vm_ids; do
+            backups_list="${backups_list} $(borg list ${borg_extra} --format={archive}{SPACE} --sort-by=name ${vzborg_repo} -P ${archs_prefix}-${VM_ID}- )"
+        done
+    else
+        # list all backups
+        backups_list=$(borg list ${borg_extra} --format={archive}{SPACE} --sort-by=name ${vzborg_repo} -P ${archs_prefix}- )
+    fi
+
+    say 'Warning: This may be slow, specially with remote repositories'
+    echo
+    echo 'Backup names                                   Original size      Compressed size    Deduplicated size'
+    for save_file in $backups_list; do
+        local sizes=$(borg info ${borg_extra} ${vzborg_repo} -P ${save_file} | sed -n 's/This archive://p')
+        printf "%-39s %17s %s %17s %s %17s %s\n" $save_file $(borg info ${borg_extra} ${vzborg_repo}::${save_file} | sed -n 's/This archive://p')
+    done
+    echo
+}
+vzborg_purge() {
+    if [[ ${show_command_help} = true ]]; then
+        echo
+        echo "NAME"
+        echo "  vzborg purge"
+        echo
+        echo "USAGE"
+        echo "  vzborg purge ( -i|--id) ( <vmid>|<vmid_list>|all) \\"
+        echo "                   [ ( -k|--keep) <n>] \\"
+        echo "                   [ --keep-last=<n> ] \\"
+        echo "                   [ --keep-hourly=<n>] \\"
+        echo "                   [ --keep-daily=<n>] \\"
+        echo "                   [ --keep-weekly=<n>] \\"
+        echo "                   [ --keep-monthly=<n>] \\"
+        echo "                   [ --keep-yearly=<n>] \\"
+        echo "                   [ ( -r|--repository) <repository>] "
+        echo
+        echo "  <vmid>: <integer> (100 - N) The (unique) ID of a PVE guest"
+        echo "  <vmid_list>: <string> (space separated list of <vmid>s"
+        echo "  Retention options:"
+        echo "    The following are the valid retention options, where <n> is the number of backups"
+        echo "    of that type to keep, or a negative number to keep them all:"
+        echo "      ( -k|--keep) <n>   Keep last <n> backups"
+        echo "      --keep-last=<n>"
+        echo "      --keep-hourly=<n>"
+        echo "      --keep-daily=<n>"
+        echo "      --keep-weekly=<n>"
+        echo "      --keep-monthly=<n>"
+        echo "      --keep-yearly=<n>"
+        echo "  <repository>: <path> (full repository path)"
+        echo
+        echo "DESCRIPTION"
+        echo "  The vzborg purge command performs a purge (prune in borgbackup parlance) operation in the "
+        echo "  default repository, or in the one specified with the -r or --repository option."
+        echo "  The operation will apply the default <retention_options>, or the one specified with"
+        echo "  the -k or --keep option in the command line, to the backups of the guests specified"
+        echo "  with the -i or --id option."
+        echo
+        echo "EXAMPLES"
+        echo
+        echo "  Purge default repository keeping 7 end of day and 4 additional end of week backups of guest 203"
+        echo "    vzborg purge -i 203 --keep-daily=7 --keep-weekly=4"
+        echo
+        echo "  Purge remote repository ssh://remote.server.com:22/mnt/remote_borg_repo keeping only the last 3 backups"
+        echo "  of all guests"
+        echo "    vzborg purge -i all --keep 3  -r ssh://remote.server.com:22/mnt/remote_borg_repo "
+        echo
+        echo "  Purge default repository keeping 7 end of day, 4 additional end of week, and 2 end of month backups"
+        echo "  of guests 101, 102 and 201"
+        echo "    vzborg purge --id '101 102 201' --keep-daily=7 --keep-weekly=4 --keep-monthly=2"
+        echo
+        echo "  Purge default repository keeping 4 end of week backups, and all end of month backups of guest 302"
+        echo "    vzborg purge --id 302 --keep-monthly=-1 --keep-weekly=4"
+        exit
+    fi
+
+    local retention=${keep_setting:-$DEFAULT_KEEP}
+    local purge_es=0
+    local purge_status=''
+    local guest=''
+    local purge_ids=''
+
+    # Check if new restore id was informed, and there is a list of guest to restore.
+    if [[ -z ${vm_ids} ]]; then
+        die "vzborg purge requires a valid (-i|--id) option."
+    fi
+
+    # purge all backups
+    if [[ $vm_ids = "all" ]]; then
+        purge_ids=$(borg list ${borg_extra} --format={archive}{NL} "${vzborg_repo}" -P ${archs_prefix}- | grep ${archs_prefix}- | cut -d"-" -f2 | cut -d"-" -f1 | sort | uniq | tr '\n' ' ')
+    else
+        purge_ids=${vm_ids}
+    fi
+    say "> Host $(hostname) - Purge job started for guests $purge_ids" |& tee -a ${detail_file}
+    say "> Repository ${vzborg_repo}" |& tee -a ${detail_file}
+    say "> with retention \"${retention}\"" |& tee -a ${detail_file}
+    # Loop through each ID
+    for VM_ID in $purge_ids; do
+        say "-> Purging backups of guest ${VM_ID}" |& tee -a ${detail_file};
+        # Get guest information from backup
+        guest=$(borg list ${borg_extra} --format="{archive} {bcomment}{NL}" ${vzborg_repo} -P ${archs_prefix}-${VM_ID} | sort -r | head -1 | cut -d"(" -f2  | cut -d")" -f1)
+
+        if [ ! -z "${guest}" ]; then
+            guest='('$guest')'            
+            # generate array with recovered backup info
+            declare -A guest_="${guest}"
+            vm_type=${guest_[vm_type]}
+            vm_hostname=${guest_[vm_hostname]}
+        else
+            vm_type='--'
+            vm_hostname='No_Backup_with_this_ID'
+            prune_status='failed'
+            printf "$line_format" $vm_type $VM_ID 0 0 0 'no' 0 0 0 $prune_status $vm_hostname >>${summary_file}
+            continue
+        fi
+
+        SECONDS=0
+        if borg prune ${borg_extra} -v -s --list ${dry_run} ${retention} --prefix ${archs_prefix}-${VM_ID} ${vzborg_repo} |& tee -a ${detail_file}; then
+            purge_status='done'
+        else
+            purge_status='failed'
+        fi
+        purge_es=$SECONDS
+        printf "$line_format" $vm_type $VM_ID 0 0 0 'no' $(($purge_es / 3600)) $(($purge_es % 3600 / 60)) $(($purge_es % 60)) $purge_status $vm_hostname >>${summary_file}
+        say "<- Done purging backups of guest ${VM_ID}" |& tee -a ${detail_file};
+    done
+
+}
+vzborg_restore() {
+    if [[ ${show_command_help} = true ]]; then
+        echo
+        echo "NAME"
+        echo "  vzborg restore"
+        echo
+        echo "USAGE"
+        echo "  vzborg restore ( (-b|--backup) <backup_name> | (-i|--id) ( <vmid>|<vmid_list>|all) \\"
+        echo "                   [ (-n|--new-id) <new_vmid>] \\"
+        echo "                   [ (-f|--force)] \\"
+        echo "                   [ (-r|--repository) <repository>] \\"
+        echo "                   [ (-s|--storage) <storage>]"
+        echo
+        echo "  <backup_name>: <string> (name of a vzborg backup of a guest)."
+        echo "  <vmid>: <integer> (100 - N) The (unique) ID of a backed up PVE guest."
+        echo "  <vmid_list>: <string> (space separated list of <vmid>s"
+        echo "  <new_vmid>: <integer> (100 - N) The new ID of the restored guest."
+        echo "  <repository>: <path> (full repository path)."
+        echo "  <storage>: <string> (Proxmox storage where the guest must be restored."
+        echo
+        echo "DESCRIPTION"
+        echo "  The vzborg restore command, restores guests from a backups in the"
+        echo "  default repository, or from the one specified with the -r or --repository option,"
+        echo "  to a given pve storage (or local if none specified)."
+        echo "  You can use the (-b|--backup) option, to restore a specific backup."
+        echo "  If you use the (-i|--id) option, you can restore the last backup of one, a list, "
+        echo "  or all the guests in the repository restored."
+        echo "  Using the (-n|--new-id) option, you can specify with which ID, the guest must"
+        echo "  be restored. If it is not specified, vzborg will use the original guest ID."
+        echo "  If you want the restore operation to override an existing guest, then you should"
+        echo "  use the (-f|--force) option."
+        echo
+        echo "EXAMPLES"
+        echo
+        echo "  Restore the last backup of guest 124 from default repository"
+        echo "  to default storage, forcing overwrite."
+        echo "    vzborg restore --id 124 --force"
+        echo
+        echo "  Restore the last backup of guest 207 from default repository"
+        echo "  to PVE storage thinssd, as guest 215."
+        echo "    vzborg restore --id 207 --storage thinssd --new-id 215"
+        echo
+        echo "  Restore VM 1301 from backup vzborg-1301-2020_03_20-13_18_45.vma"
+        echo "  from default borg repository to storage local_lvm with new id 1432."
+        echo "    vzborg restore -b vzborg-1301-2020_03_20-13_18_45.vma -s local-lvm --new-id 1432"
+        echo
+        echo "  Restore CT 141 from backup vzborg-141-2020_03_20-13_18_45.tar"
+        echo "  in borg repository /mnt/vzborgrepo to default storage local."
+        echo "    vzborg restore -b vzborg-141-2020_03_20-13_18_45.tar -r /mnt/vzborgrepo"
+        echo
+        exit
+    fi
+
+    local backup_id=${vm_ids:-''}
+    local borg_archive=${backup_name}
+    local borg_format='--format={archive}{NL}'
+    local find_archive=
+    local guest_config=''
+    local guest_has_mount_points=false
+    local ids_=''
+    local restore_by_backup_name=false
+    local restore_id=${vm_new_id:-''}
+    local restore_list_of_guests=false
+    local restore_storage=${pve_storage:-local}
+    local rootfs_size=32
+    local unprivileged=0
+    local vm_type=''
+
+    # check if required options where informed and are valid
+    if [ -z "${borg_archive}" ]; then
+        # no backup name to restore
+        if [[ -z ${backup_id} ]]; then
+            # no backup ids
+            die "restore requires a backup name or backup guest ID."
+        else
+            # Backup id/ids informed.
+            # Check if a list of ids was informed.
+            ids_=( ${backup_id} )
+            if [[  ${#ids_[@]} -gt 1  ]]; then
+                # Have a list of ids to restore.
+                restore_list_of_guests=true
+                # Check if new restore id was informed.
+            else
+                if [[ ${backup_id} = 'all' ]]; then
+                    # Restore all guests. Get a list of Ids of all backups.
+                    restore_list_of_guests=true
+                    backup_id=$(borg list ${borg_extra} --format={archive}{NL} --sort-by=name ${vzborg_repo} -P ${archs_prefix}-  | cut -d"-" -f2 | cut -d"-" -f1 | uniq | tr '\n' ' ')
+                fi
+            fi
+            # Check if new restore id was informed, and there is a list of guest to restore.
+            if ! [[ -z ${restore_id} ]] && [[ ${restore_list_of_guests} = true  ]]; then
+                die "you can not use (-n|--new-id) option with a list of IDs or \"all\"."
+            fi
+        fi 
+    else
+        if ! [[ -z ${backup_id} ]]; then
+            # no backup id
+            die "vzborg restore requires a (-b|--backup) or a (-i|--id) option, but not both."
+        fi
+        # check if backup exists in repository
+        find_archive=$(borg info ${borg_extra} ${vzborg_repo}::${borg_archive})
+        if [[ -z $find_archive ]]; then
+            die "backup ${borg_archive} does not exist in repository ${vzborg_repo}."
+        fi
+        # get backup guest ID from backup name
+        backup_id=$(echo "${borg_archive}" | cut -d"-" -f2 | cut -d"-" -f1)
+        if ! (is_valid_guest_id "${backup_id}") ; then
+            # invalid guest ID for backup
+            die "could not get a valid guest ID number from backup name \"${borg_archive}\"."
+        fi
+        restore_by_backup_name=true
+    fi
+    # get info about restore storage
+    storage_content=$(sed -n "/: ${restore_storage}/,/:/{s/^[[:space:]]*content //p }" /etc/pve/storage.cfg)
+    if [[ -z ${storage_content} ]]; then
+        # invalid guest ID for backup
+        die "the restore storage \"${restore_storage}\" is not valid."
+    fi 
+    if [[ -z ${restore_id} ]] && [[ ${restore_list_of_guests} = false ]]; then
+        # no restore id.(-n|--new-id) informed. Restore to original id.
+        restore_id="${backup_id}"
+    fi
+
+    # end initial validation
+    ############
+
+    # Loop through each VM ID
+    for VM_ID in $backup_id; do
+        if [[ ${restore_list_of_guests} = true ]]; then
+            # Restore to original id.
+            restore_id="${VM_ID}"
+        fi
+        if [[ -z  ${force_overwrite} ]]; then
+            # force overwrite not specified, check if restore id exists
+            if [ -e "${ct_conf_dir}${restore_id}.conf" ]; then
+                #   Exists a container with that ID
+                sorry "a container with ID \"${restore_id}\" exists and option (-f|--force) was not specified."
+                continue
+            else
+                if [ -e "${vm_conf_dir}${restore_id}.conf" ]; then
+                    # exists a virtual machine with that ID
+                    sorry "a qemu VM with ID \"${restore_id}\" exists and option (-f|--force) was not specified."
+                    continue
+                fi
+            fi
+        fi
+        if [[ ${restore_by_backup_name} = false ]]; then
+            # Get the backup name of the last backup for the guest
+            borg_archive=$(borg list ${borg_extra} ${borg_format} ${vzborg_repo} -P ${archs_prefix}-${VM_ID}- | sort -r | head -1)
+            if [[ -z ${borg_archive} ]]; then
+                sorry "guest ${VM_ID} has no backup in repository ${vzborg_repo}."
+                continue
+            fi
+        fi
+        case ${borg_archive} in
+        *.tar)
+            if [[ ! "$storage_content" == *rootdir* ]]; then
+                sorry "Storage \"${restore_storage}\" is not a containers storage"
+                continue
+            fi
+            vm_type='CT'
+            guest_config="$(borg list ${borg_extra} --format='{bcomment}' "${vzborg_repo}" -P "${borg_archive}" | sed -n '/BEGIN_CONFIG>/,/<END_CONFIG/{ /_CONFIG/d; p }')"
+            if echo "${guest_config}" | grep -q '^mp.:'; then
+                # container has mount points, better to restore it using intermediate dump file
+                guest_has_mount_points=true
+            else
+                # find root file system size
+                rootfs_size=$(echo "${guest_config}" | sed -n 's/^rootfs:.*size=\([0-9]*\).*/\1/p')
+                # check if it is an unprivileged container
+                if echo "${guest_config}" | grep -q '^unprivileged: 1'; then
+                    unprivileged=1
+                fi
+            fi
+            ;;
+        *.vma)
+            if [[ ! "$storage_content" == *images* ]]; then
+                say "Storage \"${restore_storage}\" is not an images storage"
+                continue
+            fi
+            vm_type='VM'
+            ;;
+        *) sorry "\"${borg_archive}\" is not a qemu or lxc valid backup name" ;;
+        esac
+
+        say "> Restoring backup ${borg_archive} as ${vm_type} ${restore_id} to storage ${restore_storage}"
+        if [[ ${vm_type} == 'VM' ]]; then
+            borg extract ${borg_extra} --stdout ${vzborg_repo}::${borg_archive} | qmrestore - ${restore_id} --storage ${restore_storage} ${force_overwrite}
+        else
+            if [[ ${guest_has_mount_points} = true ]]; then
+                #echo 'Guest has mount points, restoring to temporary file'
+                local temp_dump_dir="$(mktemp -d ${temp_dir}/vzborg.XXXXXX)"
+                local dump_file=${borg_archive/${archs_prefix}/vzdump-lxc}
+                borg extract ${borg_extra} --stdout ${vzborg_repo}::${borg_archive} | lzop -5 --output=${temp_dump_dir}/${dump_file}.lzo -
+                pct restore ${restore_id} ${temp_dump_dir}/${dump_file}.lzo --storage ${restore_storage} ${force_overwrite}
+                rm -r ${temp_dump_dir}
+            else
+                borg extract ${borg_extra} --stdout ${vzborg_repo}::${borg_archive} | pct restore ${restore_id} --storage ${restore_storage} ${force_overwrite} --rootfs ${rootfs_size} --unprivileged ${unprivileged} -
+            fi
+        fi
+        say "< Restore finished"
+        echo
+    done
+}
+vzborg_version() {
+    echo 'vzborg 0.8.0'
+    borg ${borg_extra} --version
+    pveversion
+    # 0.3.1 (alfa)
+    #   tested in proxmox 6.X
+    # 0.3.2 (alfa)
+    #   tested in proxmox 5.x
+    # 0.4.0 (alfa)
+    #   installation script
+    #   sane defaults
+    # 0.5.0 (alfa)
+    #   getdump, list commands
+    #
+    # 0.6.0 (alfa)
+    #   store and show VM original conf file
+    #   more info on borg comment field
+    #
+    # 0.7.0 (alfa)
+    #   backup server configuration (ommited functionality)
+    # 0.8.0 (alfa)
+    #   restore by id functionality
+    #   updated and reformated help
+    # 0.9 (beta)
+    #   ask for contributions
+    # 1.0
+}
+
+# VzBorg main body
+
+# variables initialization
+readonly archs_prefix=vzborg
+backup_name=''
+dry_run=''
+force_overwrite=''
+keep_setting=''
+output_file=''
+purge_on_backup=false
+show_command_help=false
+vm_ids=''
+vm_new_id=''
+vzborg_command=''
+vzdump_mode='snapshot'
+vzborg_repo=''
+vzdump_quiet=0
+
+# Containers configuration directory
+ct_conf_dir="/etc/pve/nodes/$(hostname)/lxc/"
+# Qemu virtual machines configuration directory
+vm_conf_dir="/etc/pve/nodes/$(hostname)/qemu-server/"
+
+# Load variables from default configuration file
+. /etc/vzborg/default
+
+# First parameter must be vzborg command
+if [ -z "${1:-}" ]; then
+    # No vzborg command, then show help
+    vzborg_command='help'
+else
+    vzborg_command=${1}
+    shift 1
+fi
+# Options parser
+while [ $# -gt 0 ]; do
+    case "$1" in
+    -b | --backup)
+        backup_name="$2"
+        shift 2
+        ;;
+    -c | --config)
+        . /etc/vzborg/${2}
+        shift 2
+        ;;
+    -d | --dry-run)
+        dry_run="-n"
+        shift 1
+        ;;
+    -f | --force)
+        force_overwrite="--force yes"
+        shift 1
+        ;;
+    -h | --help)
+        show_command_help=true
+        shift 1
+        ;;
+    -i | --id)
+        vm_ids="$2"
+        shift 2
+        ;;
+    -k | --keep)
+        keep_setting="${keep_setting} --keep-last=${2}"
+        shift 2
+        ;;
+    --keep-last=* | --keep-hourly=* | --keep-daily=* | --keep-weekly=* | --keep-monthly=* | --keep-yearly=*)
+        keep_setting="${keep_setting} ${1}"
+        shift 1
+        ;;
+    -m | --mode)
+        vzdump_mode="$2"
+        shift 2
+        ;;
+    -n | --new-id)
+        vm_new_id="$2"
+        if ! (is_valid_guest_id "${vm_new_id}") ; then
+        # invalid guest ID for backup
+        die "the new id for restoring \"${vm_new_id}\" is not a valid guest ID number."
+        fi
+        shift 2
+        ;;
+    -p | --purge)
+        purge_on_backup=true
+        shift 1
+        ;;
+    -r | --repository)
+        vzborg_repo="$2"
+        shift 2
+        ;;
+    -s | --storage)
+        pve_storage="$2"
+        shift 2
+        ;;
+    -v | --verbose)
+        vzdump_quiet=0
+        shift 1
+        ;;
+    *)
+        die "Invalid option \"$1\". Try vzborg help"
+        ;;
+    esac
+done
+
+# if VZBORG_PASSPHRASE is defined, export it as Borg BORG_PASSPHRASE
+if [[ ! -z ${VZBORG_PASSPHRASE:-''} ]]; then
+    export BORG_PASSPHRASE="${VZBORG_PASSPHRASE}"
+fi
+
+# Assign defaults to vzborg conf variables if not defined
+borg_extra=${BORG_EXTRA:-''}
+default_compression=${DEFAULT_COMPRESSION:-'zstd,3'}
+default_keep=${DEFAULT_KEEP:-'--keep-daily=2 --keep-weekly=4 --keep-monthly=12 --keep-yearly=2'}
+default_chunker=${DEFAULT_CHUNKER:-'10,23,16,4095'}
+encryption_mode=${ENCRYPTION_MODE:-'repokey-blake2'}
+temp_dir=${VZBORG_TEMP_DIR:-'/tmp'}
+if [[ -z ${vzborg_repo} ]]; then
+    vzborg_repo=${VZBORG_REPO:-'/var/lib/vz/vzborg'}
+fi
+
+# Execute some code before running the command
+case ${vzborg_command} in
+backup | purge)
+    # create temporary files for summary and detail information
+    detail_file="$(mktemp ${temp_dir}/vzborg.XXXXXX)"
+    summary_file="$(mktemp ${temp_dir}/vzborg.XXXXXX)"
+    header_format="\n%2s  %5s  %8s  %6s  %8s  %6s  %-42s\n"
+    line_format="%2s  %5s  %02d:%02d:%02d  %6s  %02d:%02d:%02d  %6s  %-42s\n"
+    echo '' >>${detail_file}
+    echo "DETAILED VZBORG INFORMATION" >>${detail_file}
+    echo "VZBORG SUMMARY" >>${summary_file}
+    printf "$header_format" "TY" "VMID" "BCK.TIME" "BACKUP" "PUR.TIME" "PURGE" "NAME" >>${summary_file}
+    ;;
+esac
+
+# Execute command function
+case ${vzborg_command} in
+backup) vzborg_backup ;;
+delete | discard) vzborg_delete ;;
+getdump) vzborg_getdump ;;
+help) vzborg_help ;;
+info) vzborg_info ;;
+list) vzborg_list ;;
+list-size) vzborg_list_size ;;
+purge) vzborg_purge ;;
+restore) vzborg_restore ;;
+version) vzborg_version ;;
+*) die "Invalid or not given vzborg command. Try \"vzborg help\"" ;;
+esac
+
+# Execute some code after running the command
+case ${vzborg_command} in
+backup | purge)
+    echo "" >>${summary_file}
+    say "< Host $(hostname) - ${vzborg_command} job complete!" |& tee -a ${detail_file}
+    echo
+    cat ${summary_file}
+
+    # Append detailed information
+    cat ${detail_file} >>${summary_file}
+    # Send VzBorg statistics mail
+    if [ ! -z "${NOTIFY_TO:-}" ]; then
+        if mail -s "$(hostname) - VzBorg ${vzborg_command} statistics." ${NOTIFY_TO} <${summary_file}; then
+            say "Host $(hostname) - ${vzborg_command} statistics mail sent."
+        else
+            say "Host $(hostname) - Failed to send ${vzborg_command} statistics mail."
+        fi
+    fi
+    rm -r ${detail_file} ${summary_file}
+    ;;
+esac

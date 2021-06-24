@@ -1,0 +1,94 @@
+############################
+# VZBORG DEFAULT VARIABLES #
+############################
+
+# BORG REPOSITORY PATH
+#
+# You can configure a default path to the borg repository here
+# if you do not want to type it on every vzborg command.
+#
+# This default repository will be created on first backup if none is informed
+# and it does not exist.
+#
+# Local repository example:
+# VZBORG_REPO=/var/lib/vz/vzborg
+#
+# Remote repositories examples:
+# (You should set up ssh keys for automatic access to a remote borg repository)
+#
+# Remote repository on your remote server, VPS, etc.
+# VZBORG_REPO="ssh://root@example.com:22/var/lib/vzborgbackups/"
+#
+# Remote repository using BorgBase service
+# VZBORG_REPO="i5a7ww4c@i5a7ww4c.repo.borgbase.com:repo"
+#
+# Remote repository using rsync.net service (see BORG_EXTRA option)
+# VZBORG_REPO="ssh://7816@usw-s007.rsync.net:22/./myvzborgrepo"
+
+VZBORG_REPO="/var/lib/vz/vzborg/"
+
+# BORG ENCRYPTION MODE
+#
+# Select your borg encryption mode, for automatic repository creation on first backup
+#
+# Choose one of:
+# < none|repokey|keyfile|authenticated|authenticated-blake2|repokey-blake2|keyfile-blake2 >
+#
+# For detailed information about encryption modes see borg documentation:
+#
+# https://borgbackup.readthedocs.io/en/stable/usage/init.html
+#
+ENCRYPTION_MODE=repokey-blake2
+
+# ENCRYPTION PASSPHRASE
+#
+# Put here your borg repository passphrase if you dont want being 
+# asked for it, for example if you are automating backups.
+# This passphrase will also be used if the borg repository is created
+# automatically on first backup
+VZBORG_PASSPHRASE='MySecretBorgRepositoryPassphrase'
+
+# NOTIFICATION OF VZBORG JOBS
+#
+# Uncomment and edit to send VzBorg statistics by mail
+#NOTIFY_TO="admin@example.com"
+
+# REPOSITORY PURGING
+# 
+# VzBorg purges (gets rid of old backups) using keep settings
+# You can configure here a default keep setting to use
+# when purging your repository with VzBorg
+#
+# For detailed information about purging (prunning in borgbackup parlance)
+# see borg backup documentation:
+# https://borgbackup.readthedocs.io/en/stable/usage/prune.html
+#
+DEFAULT_KEEP='--keep-daily=2 --keep-weekly=4 --keep-monthly=6 --keep-yearly=2'
+
+# COMPRESSION
+# 
+# Set a default compression
+DEFAULT_COMPRESSION="zstd,3"
+
+# CHUNKER PARAMETERS
+# Borg 1.1 default
+# DEFAULT_CHUNKER='19,23,21,4095'
+# Classic default
+# DEFAULT_CHUNKER='10,23,16,4095'
+# Others options
+# DEFAULT_CHUNKER='10,14,12,4095'
+DEFAULT_CHUNKER='9,16,12,4095'
+
+# TEMPORARY DIR
+# 
+# Set a default directory for temporary files
+VZBORG_TEMP_DIR="/tmp"
+
+# EXTRA BORG OPTIONS
+#
+# Example for showing borg progress
+# BORG_EXTRA='--progress'
+#
+# Example for backing up to rsync.net borg service
+# BORG_EXTRA='--remote-path=borg1'
+BORG_EXTRA=''
